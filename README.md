@@ -20,4 +20,4 @@ Download the latest executable from the Releases section.
 Build from source
 
 pip install -r requirements.txt
-python yt_extractor_app.py
+python main.py
