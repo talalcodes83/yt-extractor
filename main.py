@@ -17,18 +17,19 @@ except ImportError:
 
 
 APP_TITLE = "Talal's YT Extractor"
-APP_GEOMETRY = "980x720"
+APP_GEOMETRY = "980x780"
 
 
 class DownloadCancelled(Exception):
     pass
 
+
 def get_ffmpeg_path():
     if getattr(sys, "frozen", False):
         return os.path.join(sys._MEIPASS, "ffmpeg")
-    else:
-        return os.path.join(os.path.dirname(__file__), "ffmpeg")
-    
+    return os.path.join(os.path.dirname(__file__), "ffmpeg")
+
+
 @dataclass
 class DownloadOptions:
     url: str
@@ -57,12 +58,13 @@ class YTDLPApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry(APP_GEOMETRY)
-        self.root.minsize(900, 640)
+        self.root.minsize(940, 700)
 
         self.ui_queue = queue.Queue()
         self.worker_thread = None
         self.stop_event = threading.Event()
         self.last_output_path = None
+        self.extractors = []
 
         self.url_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Downloads"))
@@ -77,10 +79,17 @@ class YTDLPApp:
         self.file_var = tk.StringVar(value="Saved file: --")
         self.progress_var = tk.DoubleVar(value=0.0)
 
+        self.search_var = tk.StringVar()
+        self.search_count_var = tk.StringVar(value="Supported sites: loading...")
+        self.selected_site_var = tk.StringVar(value="Selected site: --")
+
         self._setup_style()
         self._build_ui()
         self._set_mode_defaults()
         self._poll_ui_queue()
+
+        self._load_extractors()
+        self._refresh_site_search()
 
     def _setup_style(self):
         style = ttk.Style()
@@ -104,37 +113,92 @@ class YTDLPApp:
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="High-quality yt-dlp desktop wrapper with live progress and printable logs.",
+            text="yt-dlp desktop wrapper with supported-site search, live progress, and printable logs.",
             style="Subtle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
         form = ttk.LabelFrame(container, text="Download Settings", padding=12)
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
+        form.columnconfigure(2, weight=0)
+        form.columnconfigure(3, weight=1)
 
-        ttk.Label(form, text="YouTube URL").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        # Supported site search
+        ttk.Label(form, text="Search Supported Sites").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=6
+        )
+
+        self.search_entry = ttk.Entry(form, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew", pady=6)
+
+        self.search_btn = ttk.Button(form, text="Search", command=self._refresh_site_search)
+        self.search_btn.grid(row=0, column=2, sticky="ew", padx=(8, 8), pady=6)
+
+        self.clear_search_btn = ttk.Button(form, text="Clear", command=self._clear_site_search)
+        self.clear_search_btn.grid(row=0, column=3, sticky="w", pady=6)
+
+        ttk.Label(form, textvariable=self.search_count_var, style="Subtle.TLabel").grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=(0, 4)
+        )
+
+        search_results_frame = ttk.Frame(form)
+        search_results_frame.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(0, 8))
+        search_results_frame.columnconfigure(0, weight=1)
+
+        self.search_results = tk.Listbox(
+            search_results_frame,
+            height=7,
+            font=("Consolas", 10),
+            activestyle="dotbox",
+            exportselection=False,
+        )
+        self.search_results.grid(row=0, column=0, sticky="ew")
+
+        self.search_scrollbar = ttk.Scrollbar(
+            search_results_frame, orient="vertical", command=self.search_results.yview
+        )
+        self.search_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.search_results.configure(yscrollcommand=self.search_scrollbar.set)
+
+        self.search_results.bind("<<ListboxSelect>>", self._on_site_select)
+        self.search_results.bind("<Double-Button-1>", self._on_site_double_click)
+        self.search_entry.bind("<KeyRelease>", self._on_search_keyrelease)
+        self.search_entry.bind("<Return>", lambda event: self._refresh_site_search())
+
+        ttk.Label(form, textvariable=self.selected_site_var, style="Subtle.TLabel").grid(
+            row=3, column=1, columnspan=3, sticky="w", pady=(0, 8)
+        )
+
+        # URL
+        ttk.Label(form, text="Media URL").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
         self.url_entry = ttk.Entry(form, textvariable=self.url_var)
-        self.url_entry.grid(row=0, column=1, columnspan=3, sticky="ew", pady=6)
+        self.url_entry.grid(row=4, column=1, columnspan=3, sticky="ew", pady=6)
 
-        ttk.Label(form, text="Output Folder").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        # Output folder
+        ttk.Label(form, text="Output Folder").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
         self.output_entry = ttk.Entry(form, textvariable=self.output_dir_var)
-        self.output_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        self.output_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=6)
         self.browse_btn = ttk.Button(form, text="Browse", command=self._choose_output_dir)
-        self.browse_btn.grid(row=1, column=3, sticky="ew", pady=6, padx=(8, 0))
+        self.browse_btn.grid(row=5, column=3, sticky="ew", pady=6, padx=(8, 0))
 
-        ttk.Label(form, text="Mode").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        # Mode row
+        ttk.Label(form, text="Mode").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
         mode_row = ttk.Frame(form)
-        mode_row.grid(row=2, column=1, sticky="w", pady=6)
-        self.video_radio = ttk.Radiobutton(mode_row, text="Video", value="video", variable=self.mode_var, command=self._set_mode_defaults)
-        self.audio_radio = ttk.Radiobutton(mode_row, text="Audio Only", value="audio", variable=self.mode_var, command=self._set_mode_defaults)
+        mode_row.grid(row=6, column=1, sticky="w", pady=6)
+        self.video_radio = ttk.Radiobutton(
+            mode_row, text="Video", value="video", variable=self.mode_var, command=self._set_mode_defaults
+        )
+        self.audio_radio = ttk.Radiobutton(
+            mode_row, text="Audio Only", value="audio", variable=self.mode_var, command=self._set_mode_defaults
+        )
         self.video_radio.pack(side="left")
         self.audio_radio.pack(side="left", padx=(14, 0))
 
-        ttk.Label(form, text="Quality").grid(row=2, column=2, sticky="w", padx=(16, 10), pady=6)
+        ttk.Label(form, text="Quality").grid(row=6, column=2, sticky="w", padx=(16, 10), pady=6)
         self.quality_combo = ttk.Combobox(form, textvariable=self.quality_var, state="readonly", width=22)
-        self.quality_combo.grid(row=2, column=3, sticky="ew", pady=6)
+        self.quality_combo.grid(row=6, column=3, sticky="ew", pady=6)
 
-        ttk.Label(form, text="Audio Format").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(form, text="Audio Format").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=6)
         self.audio_format_combo = ttk.Combobox(
             form,
             textvariable=self.audio_format_var,
@@ -142,12 +206,14 @@ class YTDLPApp:
             values=["mp3", "m4a", "wav"],
             width=12,
         )
-        self.audio_format_combo.grid(row=3, column=1, sticky="w", pady=6)
+        self.audio_format_combo.grid(row=7, column=1, sticky="w", pady=6)
 
         controls = ttk.Frame(container)
         controls.pack(fill="x", pady=12)
 
-        self.download_btn = ttk.Button(controls, text="Start Download", style="Action.TButton", command=self.start_download)
+        self.download_btn = ttk.Button(
+            controls, text="Start Download", style="Action.TButton", command=self.start_download
+        )
         self.download_btn.pack(side="left")
 
         self.cancel_btn = ttk.Button(controls, text="Cancel", command=self.cancel_download, state="disabled")
@@ -191,6 +257,115 @@ class YTDLPApp:
         log_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(log_btns, text="Clear Logs", command=self.clear_logs).pack(side="left")
         ttk.Button(log_btns, text="Copy Logs", command=self.copy_logs).pack(side="left", padx=(8, 0))
+
+    def _load_extractors(self):
+        if yt_dlp is None:
+            self.extractors = []
+            self.search_count_var.set("Supported sites: yt-dlp not installed")
+            return
+
+        try:
+            from yt_dlp.extractor import gen_extractors
+
+            loaded = []
+            seen = set()
+
+            for extractor in gen_extractors():
+                name = getattr(extractor, "IE_NAME", "") or ""
+                desc = getattr(extractor, "IE_DESC", None)
+                if not name or name == "generic":
+                    continue
+                key = (name.lower(), str(desc or name).lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                loaded.append((name, str(desc or name)))
+
+            loaded.sort(key=lambda item: item[0].lower())
+            self.extractors = loaded
+            self.search_count_var.set(f"Supported sites loaded: {len(self.extractors)}")
+
+        except Exception as exc:
+            self.extractors = []
+            self.search_count_var.set("Supported sites: failed to load")
+            self.append_log(f"Could not load extractor list: {exc}")
+
+    def search_sites(self, query: str):
+        query = (query or "").strip().lower()
+
+        if not query:
+            return self.extractors[:200]
+
+        results = []
+        for name, desc in self.extractors:
+            name_l = name.lower()
+            desc_l = desc.lower()
+
+            if query in name_l or query in desc_l:
+                results.append((name, desc))
+                continue
+
+            query_parts = query.split()
+            if query_parts and all(part in f"{name_l} {desc_l}" for part in query_parts):
+                results.append((name, desc))
+
+        return results[:200]
+
+    def _refresh_site_search(self):
+        self.search_results.delete(0, tk.END)
+
+        if yt_dlp is None:
+            self.search_results.insert(tk.END, "yt-dlp is not installed")
+            self.search_count_var.set("Supported sites: unavailable")
+            return
+
+        matches = self.search_sites(self.search_var.get())
+
+        if not matches:
+            self.search_results.insert(tk.END, "No supported sites found")
+            self.search_count_var.set("Matches: 0")
+            self.selected_site_var.set("Selected site: --")
+            return
+
+        for name, desc in matches:
+            self.search_results.insert(tk.END, f"{name}  |  {desc}")
+
+        self.search_count_var.set(f"Matches: {len(matches)} / {len(self.extractors)}")
+        self.search_results.selection_clear(0, tk.END)
+        self.search_results.selection_set(0)
+        self._on_site_select()
+
+    def _clear_site_search(self):
+        self.search_var.set("")
+        self._refresh_site_search()
+
+    def _on_search_keyrelease(self, event=None):
+        self._refresh_site_search()
+
+    def _on_site_select(self, event=None):
+        selection = self.search_results.curselection()
+        if not selection:
+            self.selected_site_var.set("Selected site: --")
+            return
+
+        selected_text = self.search_results.get(selection[0])
+        self.selected_site_var.set(f"Selected site: {selected_text}")
+
+    def _on_site_double_click(self, event=None):
+        selection = self.search_results.curselection()
+        if not selection:
+            return
+
+        selected_text = self.search_results.get(selection[0])
+        self.append_log(f"Selected supported site: {selected_text}")
+
+    def detect_site(self, url):
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info.get("extractor_key")
+        except Exception:
+            return None
 
     def _set_mode_defaults(self):
         if self.mode_var.get() == "video":
@@ -256,16 +431,23 @@ class YTDLPApp:
 
     def _set_controls_running(self, running: bool):
         state_normal = "disabled" if running else "normal"
+
+        self.search_entry.configure(state=state_normal)
+        self.search_btn.configure(state=state_normal)
+        self.clear_search_btn.configure(state=state_normal)
+
         self.url_entry.configure(state=state_normal)
         self.output_entry.configure(state=state_normal)
         self.browse_btn.configure(state=state_normal)
         self.video_radio.configure(state=state_normal)
         self.audio_radio.configure(state=state_normal)
+
         self.quality_combo.configure(state="disabled" if running else "readonly")
         if self.mode_var.get() == "audio":
             self.audio_format_combo.configure(state="disabled" if running else "readonly")
         else:
             self.audio_format_combo.configure(state="disabled")
+
         self.download_btn.configure(state="disabled" if running else "normal")
         self.cancel_btn.configure(state="normal" if running else "disabled")
 
@@ -316,13 +498,21 @@ class YTDLPApp:
         output_dir = self.output_dir_var.get().strip()
 
         if not url:
-            raise ValueError("Please enter a YouTube URL.")
+            raise ValueError("Please enter a URL.")
         if not re.match(r"^https?://", url, re.IGNORECASE):
             raise ValueError("Please enter a valid URL starting with http:// or https://")
         if not output_dir:
             raise ValueError("Please choose an output folder.")
 
         os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                extractor = info.get("extractor_key", "Unknown")
+                self.append_log(f"Detected site: {extractor}")
+        except Exception as e:
+            raise ValueError("This URL may not be supported by yt-dlp.") from e
 
         return DownloadOptions(
             url=url,
@@ -452,7 +642,10 @@ class YTDLPApp:
 
         elif status == "finished":
             filename = os.path.basename(d.get("filename", ""))
-            self._emit("progress", {"percent": 100.0, "percent_text": "100.0%", "speed": "--", "eta": "00:00"})
+            self._emit(
+                "progress",
+                {"percent": 100.0, "percent_text": "100.0%", "speed": "--", "eta": "00:00"},
+            )
             self._emit("log", f"Download phase finished for {filename}. Processing with ffmpeg if needed...")
             self._emit("status", "Post-processing...")
 
@@ -470,8 +663,10 @@ class YTDLPApp:
                 title = info.get("title", "Unknown title")
                 uploader = info.get("uploader", "Unknown uploader")
                 duration = self._format_eta(info.get("duration")) if info.get("duration") else "--"
+                extractor = info.get("extractor_key", "Unknown")
 
                 self._emit("title", title)
+                self._emit("log", f"Extractor: {extractor}")
                 self._emit("log", f"Title: {title}")
                 self._emit("log", f"Uploader: {uploader}")
                 self._emit("log", f"Duration: {duration}")
